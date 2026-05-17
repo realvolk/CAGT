@@ -69,20 +69,19 @@ Press `M` to go back to the curve.
 # Default Fan Curve
 
 | Temp (°C) | Fan Speed |
-|-----------|------------|
-| `< 20` | `0%` |
-| `20 – 34` | `20%` |
-| `35 – 49` | `30%` |
-| `50 – 59` | `45%` |
-| `60 – 69` | `60%` |
-| `70 – 79` | `75%` |
-| `80 – 89` | `90%` |
-| `≥ 90` | `100%` |
+|-----------|-----------|
+| 20 | 0% |
+| 35 | 20% |
+| 50 | 30% |
+| 60 | 45% |
+| 70 | 60% |
+| 80 | 75% |
+| 90 | 90% |
+| 100 | 100% |
 
-The curve is hardcoded.
+Temperatures between these points are linearly interpolated (Example: at 42°C the fan runs at ~25%, not a flat 20% or 30%.)
 
-If you want a different curve, edit the `fan_curve()` function and recompile.
-
+The curve is hardcoded in `fan_curve()`. Edit the `points` array and recompile to customize.
 ---
 
 # Supported GPUs
