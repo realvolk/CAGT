@@ -186,13 +186,34 @@ double convert_temp(int celsius) {
 
 /* Default fan curve. Temperatures are in Celsius. Edit the thresholds here. */
 int fan_curve(int temp) {
-    if (temp < 20) return 0;
-    if (temp < 35) return 20;
-    if (temp < 50) return 30;
-    if (temp < 60) return 45;
-    if (temp < 70) return 60;
-    if (temp < 80) return 75;
-    if (temp < 90) return 90;
+    /* Curve points: {temperature_C, fan_percent} */
+    int points[][2] = {
+        {20, 0},
+        {35, 20},
+        {50, 30},
+        {60, 45},
+        {70, 60},
+        {80, 75},
+        {90, 90},
+        {100, 100}
+    };
+    int n = 8;
+
+    if (temp <= points[0][0]) return points[0][1];
+    if (temp >= points[n-1][0]) return points[n-1][1];
+
+    /* Interpolation */
+    for (int i = 0; i < n - 1; i++) {
+        if (temp >= points[i][0] && temp <= points[i+1][0]) {
+            int t0 = points[i][0];
+            int t1 = points[i+1][0];
+            int f0 = points[i][1];
+            int f1 = points[i+1][1];
+
+            return f0 + (f1 - f0) * (temp - t0) / (t1 - t0);
+        }
+    }
+
     return 100;
 }
 
@@ -383,6 +404,16 @@ int main() {
     sleep(1);
 
     set_fan_manual();
+
+    char perm_test[300];
+    snprintf(perm_test, sizeof(perm_test), "%s/pwm1", hwmon_path);
+    FILE *pt = fopen(perm_test, "w");
+    if (!pt) {
+        printf("[CAGT] Cannot write to hwmon — permission denied.\n");
+        printf("[CAGT] Run with: sudo ./cagt\n");
+        return 1;
+    }
+    fclose(pt);
 
     initscr();
     cbreak();
