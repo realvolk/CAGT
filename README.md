@@ -1,6 +1,6 @@
 <p align="center">
   <strong>╔══════════════════════════════════════╗</strong><br>
-  <strong>║        CAGT — Control AMD GPU Fan    ║</strong><br>
+  <strong>║        CAGT — AMD GPU Fan Control    ║</strong><br>
   <strong>╚══════════════════════════════════════╝</strong>
 </p>
 
