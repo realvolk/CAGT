@@ -1,3 +1,7 @@
+Here's the updated README:
+
+---
+
 <p align="center">
   <strong>╔══════════════════════════════════════╗</strong><br>
   <strong>║        CAGT — AMD GPU Fan Control    ║</strong><br>
@@ -12,7 +16,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v1.1.0-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-v1.2.0-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/Language-C-A8B9CC?style=flat-square&logo=c" alt="C">
   <img src="https://img.shields.io/badge/TUI-ncurses-FFB6C1?style=flat-square" alt="ncurses">
   <img src="https://img.shields.io/badge/License-Volk_Open_License_1.0-yellow?style=flat-square" alt="License">
@@ -31,21 +35,26 @@ It reads your GPU temperature directly from `hwmon`, runs it through a fan curve
 # Quick Start
 
 ```bash
-gcc -O2 -o cagt cagt.c -lncurses
+gcc -std=c99 -O2 -o cagt cagt.c -lncurses
 chmod +x cagt
 sudo ./cagt
 ```
+
 ---
 
 # Controls
 
 | Key | Action |
 |------|--------|
+| `1 – 9` | Select GPU (multi-GPU systems) |
 | `M` | Toggle Manual / Auto mode |
 | `T` | Cycle temperature unit (`°C → °F → K`) |
+| `S` | Cycle temp sensor (Edge / Junction / Memory) |
+| `C` | Cycle fan curve (Default / Quiet / Aggressive / Linear) |
+| `R` | Reset peak temperature |
 | `+ / -` | Adjust fan by ±5% (enters Manual) |
 | `↑ / ↓` | Adjust fan by ±1% (enters Manual) |
-| `0 – 9` | Set fan to 0% – 90% instantly |
+| `0` | Set fan to 0% instantly |
 | `Q` | Quit (restores auto fan control) |
 
 All manual adjustments auto-switch you into Manual mode.
@@ -56,13 +65,19 @@ Press `M` to go back to the curve.
 
 # Features
 
-- Clean `ncurses` TUI — color-coded temps, fan curve visualization
-- Auto fan curve — 7-point temperature-to-speed mapping
+- Clean `ncurses` TUI — color-coded temps, fan curve visualization, RPM display
+- Multi-GPU support — tabbed title bar, per-GPU independent state
+- Auto fan curves — 4 profiles: Default, Quiet, Aggressive, Linear
+- Multi-sensor — Edge, Junction, Memory temperature where available
 - Manual override — granular 1% or 5% steps, plus instant presets
-- Temperature units — Celsius, Fahrenheit, or Kelvin (yes, really)
+- Temperature units — Celsius, Fahrenheit, or Kelvin
+- Peak temperature tracking with reset
+- Zero RPM detection
+- Runtime counter
+- RDNA3 `fan_curve` interface support
+- Safe exit with verified auto-restore — handles known `pwm1_enable` quirks
 - 25+ GPU detection — Polaris, Vega, Navi, RDNA3, and older GCN
 - Single file — no headers, no build system, no dependencies beyond `ncurses`
-- Safe exit — `SIGINT`, `SIGTERM`, or `Q` restores automatic fan control
 
 ---
 
@@ -79,9 +94,12 @@ Press `M` to go back to the curve.
 | 90 | 90% |
 | 100 | 100% |
 
-Temperatures between these points are linearly interpolated (Example: at 42°C the fan runs at ~25%, not a flat 20% or 30%.)
+Also available: Quiet, Aggressive, and Linear curves.
 
-The curve is hardcoded in `fan_curve()`. Edit the `points` array and recompile to customize.
+Temperatures between points are linearly interpolated.
+
+Curves are hardcoded in `fan_curve()`. Edit the `points` arrays and recompile to customize.
+
 ---
 
 # Supported GPUs
@@ -124,8 +142,8 @@ sudo xbps-install ncurses-devel
 ```text
 CAGT/
 ├── cagt.c           # the entire program
-├── LICENSE         # Volk Open License 1.0
-└── README.md       # this file
+├── LICENSE          # Volk Open License 1.0
+└── README.md        # this file
 ```
 
 ---
