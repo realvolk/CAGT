@@ -7,6 +7,8 @@
 #include <ncurses.h>
 #include <time.h>
 
+#define MAX_GPUS 8
+
 static char hwmon_path[256];
 static char gpu_name[128] = "Unknown AMD GPU";
 static char driver_name[32] = "unknown";
@@ -38,6 +40,32 @@ static int fan_curve_available = 0;
 static int overdrive_available = 0;
 static int zero_rpm_active = 0;
 static int restore_failed = 0;
+
+static int gpu_count = 0;
+static int active_gpu = 0;
+
+typedef struct {
+    char hwmon_path[256];
+    char gpu_name[128];
+    char device_path[256];
+    char short_name[32];
+    int gpu_generation;
+    int fan_count;
+    int fan_rpm_available;
+    int pwm_writable;
+    int fan_curve_available;
+    int overdrive_available;
+    int temp2_available;
+    int temp3_available;
+    int manual_mode;
+    int manual_speed;
+    int curve_profile;
+    int max_temp_c;
+    int zero_rpm_active;
+    int restore_failed;
+} GPUState;
+
+static GPUState gpus[MAX_GPUS];
 
 struct gpu_entry {
     const char *device_id;
@@ -86,25 +114,50 @@ static const struct gpu_entry known_gpus[] = {
     {NULL, NULL, 0}
 };
 
-static int gpu_generation = -1;
 int read_file_int(const char *path);
 
-void restore_fan_auto() {
-    if (hwmon_path[0] == '\0') return;
+void sync_globals_from_gpu(int idx) {
+    GPUState *g = &gpus[idx];
+    strcpy(hwmon_path, g->hwmon_path);
+    strcpy(gpu_name, g->gpu_name);
+    strcpy(device_path, g->device_path);
+    fan_count = g->fan_count;
+    fan_rpm_available = g->fan_rpm_available;
+    pwm_writable = g->pwm_writable;
+    fan_curve_available = g->fan_curve_available;
+    overdrive_available = g->overdrive_available;
+    temp2_available = g->temp2_available;
+    temp3_available = g->temp3_available;
+    manual_mode = g->manual_mode;
+    manual_speed = g->manual_speed;
+    curve_profile = g->curve_profile;
+    max_temp_c = g->max_temp_c;
+    zero_rpm_active = g->zero_rpm_active;
+    restore_failed = g->restore_failed;
+}
+
+void sync_gpu_from_globals(int idx) {
+    GPUState *g = &gpus[idx];
+    g->manual_mode = manual_mode;
+    g->manual_speed = manual_speed;
+    g->curve_profile = curve_profile;
+    g->max_temp_c = max_temp_c;
+    g->zero_rpm_active = zero_rpm_active;
+    g->restore_failed = restore_failed;
+}
+
+void restore_fan_auto_gpu(GPUState *g) {
+    if (g->hwmon_path[0] == '\0') return;
     
-    if (fan_curve_available) {
+    if (g->fan_curve_available) {
         char path[300];
-        snprintf(path, sizeof(path), "%s/gpu_od/fan_curve", hwmon_path);
+        snprintf(path, sizeof(path), "%s/gpu_od/fan_curve", g->hwmon_path);
         FILE *f = fopen(path, "w");
-        if (f) {
-            fprintf(f, "c");
-            fclose(f);
-            return;
-        }
+        if (f) { fprintf(f, "c"); fclose(f); return; }
     }
     
     char path[300];
-    snprintf(path, sizeof(path), "%s/pwm1_enable", hwmon_path);
+    snprintf(path, sizeof(path), "%s/pwm1_enable", g->hwmon_path);
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "2");
@@ -119,23 +172,23 @@ void restore_fan_auto() {
     fclose(f);
     
     char pwm_path[300];
-    snprintf(pwm_path, sizeof(pwm_path), "%s/pwm1", hwmon_path);
+    snprintf(pwm_path, sizeof(pwm_path), "%s/pwm1", g->hwmon_path);
     f = fopen(pwm_path, "w");
-    if (f) {
-        fprintf(f, "%d", (50 * 255) / 100);
-        fclose(f);
-    }
+    if (f) { fprintf(f, "%d", (50 * 255) / 100); fclose(f); }
     
-    snprintf(path, sizeof(path), "%s/pwm1_enable", hwmon_path);
+    snprintf(path, sizeof(path), "%s/pwm1_enable", g->hwmon_path);
     f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "2");
     fclose(f);
     
     actual = read_file_int(path);
-    if (actual != 2) {
-        restore_failed = 1;
-    }
+    if (actual != 2) g->restore_failed = 1;
+}
+
+void restore_fan_auto() {
+    for (int i = 0; i < gpu_count; i++) restore_fan_auto_gpu(&gpus[i]);
+    if (gpu_count > 0) restore_failed = gpus[active_gpu].restore_failed;
 }
 
 void handle_exit(int sig) {
@@ -169,23 +222,48 @@ void write_file_int(const char *path, int value) {
     fclose(f);
 }
 
-const char* lookup_gpu_name(const char *device_id) {
-    for (int i = 0; known_gpus[i].device_id != NULL; i++) {
-        if (strstr(device_id, known_gpus[i].device_id)) {
-            gpu_generation = known_gpus[i].generation;
-            return known_gpus[i].name;
-        }
+void detect_capabilities_gpu(GPUState *g) {
+    char path[300];
+    
+    snprintf(path, sizeof(path), "%s/pwm1", g->hwmon_path);
+    FILE *f = fopen(path, "w");
+    if (f) { g->pwm_writable = 1; fclose(f); }
+    
+    snprintf(path, sizeof(path), "%s/gpu_od/fan_curve", g->hwmon_path);
+    f = fopen(path, "r");
+    if (f) { g->fan_curve_available = 1; fclose(f); }
+    
+    snprintf(path, sizeof(path), "%s/../pp_od_clk_voltage", g->hwmon_path);
+    f = fopen(path, "w");
+    if (f) { g->overdrive_available = 1; fclose(f); }
+    
+    snprintf(path, sizeof(path), "%s/temp2_input", g->hwmon_path);
+    if (read_file_int(path) >= 0) g->temp2_available = 1;
+    
+    snprintf(path, sizeof(path), "%s/temp3_input", g->hwmon_path);
+    if (read_file_int(path) >= 0) g->temp3_available = 1;
+    
+    snprintf(path, sizeof(path), "%s/fan1_input", g->hwmon_path);
+    if (read_file_int(path) >= 0) g->fan_rpm_available = 1;
+    
+    g->fan_count = 1;
+    for (int i = 2; i <= 4; i++) {
+        snprintf(path, sizeof(path), "%s/pwm%d", g->hwmon_path, i);
+        f = fopen(path, "r");
+        if (!f) break;
+        fclose(f);
+        g->fan_count = i;
     }
-    return NULL;
 }
 
-int detect_amd_gpu() {
+int detect_amd_gpus() {
     const char *base = "/sys/bus/pci/devices";
     DIR *d = opendir(base);
     if (!d) return 0;
     struct dirent *e;
+    gpu_count = 0;
 
-    while ((e = readdir(d)) != NULL) {
+    while ((e = readdir(d)) != NULL && gpu_count < MAX_GPUS) {
         if (e->d_name[0] == '.') continue;
         char path[300];
         char vendor[16] = {0};
@@ -196,72 +274,61 @@ int detect_amd_gpu() {
         snprintf(path, sizeof(path), "%s/%s/device", base, e->d_name);
         read_file_str(path, device, sizeof(device));
 
-        if (strstr(vendor, "0x1002")) {
-            const char *name = lookup_gpu_name(device);
-            if (name) strcpy(gpu_name, name);
-            else snprintf(gpu_name, sizeof(gpu_name), "AMD GPU (%s)", device);
+        if (!strstr(vendor, "0x1002")) continue;
 
-            snprintf(device_path, sizeof(device_path), "%s/%s", base, e->d_name);
+        GPUState *g = &gpus[gpu_count];
+        memset(g, 0, sizeof(GPUState));
+        g->curve_profile = 0;
+        g->manual_speed = 50;
 
-            snprintf(path, sizeof(path), "%s/%s/hwmon", base, e->d_name);
-            DIR *hd = opendir(path);
-            if (!hd) continue;
-
-            struct dirent *he;
-            while ((he = readdir(hd)) != NULL) {
-                if (he->d_name[0] == '.') continue;
-                snprintf(hwmon_path, sizeof(hwmon_path), "%s/%s", path, he->d_name);
-                closedir(hd);
-                closedir(d);
-                return 1;
+        const char *name = NULL;
+        for (int i = 0; known_gpus[i].device_id != NULL; i++) {
+            if (strstr(device, known_gpus[i].device_id)) {
+                name = known_gpus[i].name;
+                g->gpu_generation = known_gpus[i].generation;
+                break;
             }
-            closedir(hd);
         }
+        if (name) strcpy(g->gpu_name, name);
+        else snprintf(g->gpu_name, sizeof(g->gpu_name), "AMD GPU (%s)", device);
+
+        snprintf(g->device_path, sizeof(g->device_path), "%s/%s", base, e->d_name);
+
+        snprintf(path, sizeof(path), "%s/%s/hwmon", base, e->d_name);
+        DIR *hd = opendir(path);
+        if (!hd) continue;
+
+        struct dirent *he;
+        while ((he = readdir(hd)) != NULL) {
+            if (he->d_name[0] == '.') continue;
+            snprintf(g->hwmon_path, sizeof(g->hwmon_path), "%s/%s", path, he->d_name);
+            break;
+        }
+        closedir(hd);
+        if (g->hwmon_path[0] == '\0') continue;
+
+        char *dash = strrchr(name ? name : g->gpu_name, ' ');
+        if (dash && strstr(dash + 1, "(")) {
+            char *paren = strchr(dash + 1, '(');
+            if (paren) {
+                size_t len = paren - (dash + 1);
+                if (len < sizeof(g->short_name)) {
+                    strncpy(g->short_name, dash + 1, len);
+                    g->short_name[len] = 0;
+                }
+            }
+        }
+        if (g->short_name[0] == '\0') {
+            char *p = strstr(g->gpu_name, "Radeon");
+            if (p) snprintf(g->short_name, sizeof(g->short_name), "%s", p);
+            else snprintf(g->short_name, sizeof(g->short_name), "GPU %d", gpu_count);
+        }
+
+        detect_capabilities_gpu(g);
+        gpu_count++;
     }
     closedir(d);
-    return 0;
-}
-
-void detect_capabilities() {
-    char path[300];
-    
-    snprintf(path, sizeof(path), "%s/pwm1", hwmon_path);
-    FILE *f = fopen(path, "w");
-    if (f) {
-        pwm_writable = 1;
-        fclose(f);
-    }
-    
-    snprintf(path, sizeof(path), "%s/gpu_od/fan_curve", hwmon_path);
-    f = fopen(path, "r");
-    if (f) {
-        fan_curve_available = 1;
-        fclose(f);
-    }
-    
-    snprintf(path, sizeof(path), "%s/../pp_od_clk_voltage", hwmon_path);
-    f = fopen(path, "w");
-    if (f) {
-        overdrive_available = 1;
-        fclose(f);
-    }
-    
-    snprintf(path, sizeof(path), "%s/temp2_input", hwmon_path);
-    if (read_file_int(path) >= 0) temp2_available = 1;
-    
-    snprintf(path, sizeof(path), "%s/temp3_input", hwmon_path);
-    if (read_file_int(path) >= 0) temp3_available = 1;
-    
-    snprintf(path, sizeof(path), "%s/fan1_input", hwmon_path);
-    if (read_file_int(path) >= 0) fan_rpm_available = 1;
-    
-    for (int i = 1; i <= 4; i++) {
-        snprintf(path, sizeof(path), "%s/pwm%d", hwmon_path, i);
-        f = fopen(path, "r");
-        if (!f) break;
-        fclose(f);
-        if (i > 1) fan_count = i;
-    }
+    return gpu_count;
 }
 
 void detect_driver() {
@@ -279,20 +346,21 @@ void detect_driver() {
     else strcpy(driver_name, "unknown");
 }
 
-void set_fan_manual() {
-    if (fan_curve_available) return;
-    
-    char path[300];
-    snprintf(path, sizeof(path), "%s/pwm1_enable", hwmon_path);
-    write_file_int(path, 1);
+void set_fan_manual_all() {
+    GPUState *g = &gpus[active_gpu];
+    if (g->fan_curve_available) return;
+    for (int i = 1; i <= g->fan_count; i++) {
+        char path[300];
+        snprintf(path, sizeof(path), "%s/pwm%d_enable", g->hwmon_path, i);
+        write_file_int(path, 1);
+    }
 }
 
-void set_fan_manual_all() {
-    if (fan_curve_available) return;
-    
-    for (int i = 1; i <= fan_count; i++) {
+void set_fan_manual_all_gpu(GPUState *g) {
+    if (g->fan_curve_available) return;
+    for (int i = 1; i <= g->fan_count; i++) {
         char path[300];
-        snprintf(path, sizeof(path), "%s/pwm%d_enable", hwmon_path, i);
+        snprintf(path, sizeof(path), "%s/pwm%d_enable", g->hwmon_path, i);
         write_file_int(path, 1);
     }
 }
@@ -301,9 +369,11 @@ void set_fan_speed(int percent) {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
     
-    if (fan_curve_available) {
+    GPUState *g = &gpus[active_gpu];
+    
+    if (g->fan_curve_available) {
         char path[300];
-        snprintf(path, sizeof(path), "%s/gpu_od/fan_curve", hwmon_path);
+        snprintf(path, sizeof(path), "%s/gpu_od/fan_curve", g->hwmon_path);
         FILE *f = fopen(path, "w");
         if (!f) return;
         for (int i = 0; i < 5; i++) {
@@ -316,9 +386,9 @@ void set_fan_speed(int percent) {
         return;
     }
     
-    for (int i = 1; i <= fan_count; i++) {
+    for (int i = 1; i <= g->fan_count; i++) {
         char path[300];
-        snprintf(path, sizeof(path), "%s/pwm%d", hwmon_path, i);
+        snprintf(path, sizeof(path), "%s/pwm%d", g->hwmon_path, i);
         int pwm = (percent * 255) / 100;
         write_file_int(path, pwm);
     }
@@ -377,12 +447,13 @@ int fan_curve(int temp) {
 }
 
 int get_temp() {
+    GPUState *g = &gpus[active_gpu];
     char path[300];
     int sensor_idx = temp_sensor + 1;
-    snprintf(path, sizeof(path), "%s/temp%d_input", hwmon_path, sensor_idx);
+    snprintf(path, sizeof(path), "%s/temp%d_input", g->hwmon_path, sensor_idx);
     int t = read_file_int(path);
     if (t < 0) {
-        snprintf(path, sizeof(path), "%s/temp1_input", hwmon_path);
+        snprintf(path, sizeof(path), "%s/temp1_input", g->hwmon_path);
         t = read_file_int(path);
     }
     if (t < 0) return -1;
@@ -390,24 +461,27 @@ int get_temp() {
 }
 
 int get_fan_rpm() {
-    if (!fan_rpm_available) return -1;
+    GPUState *g = &gpus[active_gpu];
+    if (!g->fan_rpm_available) return -1;
     char path[300];
-    snprintf(path, sizeof(path), "%s/fan1_input", hwmon_path);
+    snprintf(path, sizeof(path), "%s/fan1_input", g->hwmon_path);
     return read_file_int(path);
 }
 
 void detect_zero_rpm() {
-    zero_rpm_active = 0;
-    if (fan_curve_available) return;
+    GPUState *g = &gpus[active_gpu];
+    g->zero_rpm_active = 0;
+    if (g->fan_curve_available) return;
     
     int temp = get_temp();
     int rpm = get_fan_rpm();
     if (temp > 0 && temp < 55 && rpm == 0) {
         char path[300];
-        snprintf(path, sizeof(path), "%s/pwm1_enable", hwmon_path);
+        snprintf(path, sizeof(path), "%s/pwm1_enable", g->hwmon_path);
         int enable = read_file_int(path);
-        if (enable == 2) zero_rpm_active = 1;
+        if (enable == 2) g->zero_rpm_active = 1;
     }
+    zero_rpm_active = g->zero_rpm_active;
 }
 
 void draw_bar(WINDOW *win, int y, int x, int width, double value, double max,
@@ -472,6 +546,7 @@ void draw_controls(WINDOW *win, int start_y, int x) {
     mvwprintw(win, y++, x, "--- Controls ---");
     wattroff(win, A_BOLD);
     y++;
+    mvwprintw(win, y++, x, " 1-%d       Select GPU", gpu_count);
     mvwprintw(win, y++, x, " M         Toggle Manual / Auto");
     mvwprintw(win, y++, x, " T         Cycle °C / °F / K");
     mvwprintw(win, y++, x, " S         Cycle temp sensor");
@@ -479,7 +554,7 @@ void draw_controls(WINDOW *win, int start_y, int x) {
     mvwprintw(win, y++, x, " R         Reset peak temperature");
     mvwprintw(win, y++, x, " +/-       Adjust fan by 5%%");
     mvwprintw(win, y++, x, " Up/Down   Adjust fan by 1%%");
-    mvwprintw(win, y++, x, " 0-9       Set fan 0%% - 90%%");
+    mvwprintw(win, y++, x, " 0         Set fan 0%%");
     mvwprintw(win, y++, x, " Q         Quit (restore auto)");
 }
 
@@ -493,41 +568,61 @@ void draw_ui(int temp_c, int speed) {
     move(0, 0);
     clrtoeol();
     attron(A_REVERSE);
-    mvprintw(0, 0, " CAGT - AMD GPU Fan Control ");
+    if (gpu_count > 1) {
+        printw(" CAGT - AMD GPU Fan Control  ");
+        for (int i = 0; i < gpu_count; i++) {
+            if (i == active_gpu) {
+                wattron(stdscr, A_BOLD);
+                printw(" [%d:%s] ", i + 1, gpus[i].short_name);
+                wattroff(stdscr, A_BOLD);
+            } else {
+                printw("  %d:%s  ", i + 1, gpus[i].short_name);
+            }
+        }
+    } else {
+        printw(" CAGT - AMD GPU Fan Control ");
+    }
     attroff(A_REVERSE);
 
+    int info_row = 2;
+
     wattron(stdscr, A_BOLD);
-    mvprintw(2, 2, "GPU Information");
+    mvprintw(info_row, 2, "GPU Information");
     wattroff(stdscr, A_BOLD);
-    mvprintw(3, 4, "Model:  %s", gpu_name);
-    mvprintw(4, 4, "Driver: %s", driver_name);
-    mvprintw(5, 4, "Fans:   %d", fan_count);
+    mvprintw(info_row + 1, 4, "Model:  %s", gpu_name);
+    mvprintw(info_row + 2, 4, "Driver: %s", driver_name);
+    mvprintw(info_row + 3, 4, "Fans:   %d", fan_count);
     if (fan_rpm_available) {
         int rpm = get_fan_rpm();
-        if (rpm >= 0) mvprintw(5, 20, "(%d RPM)", rpm);
+        if (rpm >= 0) {
+            mvprintw(info_row + 3, 20, "(%d RPM)", rpm);
+            clrtoeol();
+        }
     }
-    mvprintw(6, 4, "Path:   %s", hwmon_path);
+    mvprintw(info_row + 4, 4, "Path:   %s", hwmon_path);
 
     if (restore_failed) {
         wattron(stdscr, COLOR_PAIR(3) | A_BOLD);
-        mvprintw(7, 4, "WARNING: Auto fan restore may have failed! Reboot to recover.");
+        mvprintw(info_row + 5, 4, "WARNING: Auto fan restore may have failed! Reboot to recover.");
         wattroff(stdscr, COLOR_PAIR(3) | A_BOLD);
+        info_row++;
     }
 
-    int info_row = restore_failed ? 9 : 8;
+    int status_row = info_row + 6;
     
-    move(info_row, 0);
+    move(status_row, 0);
     clrtoeol();
     wattron(stdscr, A_BOLD);
-    mvprintw(info_row, 2, "Status  [%s]", temp_unit_names[temp_unit]);
+    mvprintw(status_row, 2, "Status  [%s]", temp_unit_names[temp_unit]);
     wattroff(stdscr, A_BOLD);
 
-    mvprintw(info_row + 1, 4, "Mode: ");
+    mvprintw(status_row + 1, 4, "Mode: ");
     if (has_colors()) wattron(stdscr, COLOR_PAIR(mode_color) | A_BOLD);
     wprintw(stdscr, "%s", manual_mode ? "MANUAL" : "AUTO (curve)");
     if (has_colors()) wattroff(stdscr, COLOR_PAIR(mode_color) | A_BOLD);
     
-    if (!overdrive_available && gpu_generation >= GEN_RDNA3) {
+    GPUState *g = &gpus[active_gpu];
+    if (!g->overdrive_available && g->gpu_generation >= GEN_RDNA3) {
         wattron(stdscr, COLOR_PAIR(3));
         wprintw(stdscr, "  [Overdrive not enabled!]");
         wattroff(stdscr, COLOR_PAIR(3));
@@ -536,14 +631,14 @@ void draw_ui(int temp_c, int speed) {
     if (zero_rpm_active) {
         wprintw(stdscr, "  [Zero RPM active]");
     }
-
-    mvprintw(info_row + 2, 4, "Sensor: ");
+    clrtoeol();
+    mvprintw(status_row + 2, 4, "Sensor: ");
     wprintw(stdscr, "%s", temp_sensor_names[temp_sensor]);
     if (temp_sensor > 0 && !(temp_sensor == 1 ? temp2_available : temp3_available)) {
         wprintw(stdscr, " (unavailable, using edge)");
     }
-
-    mvprintw(info_row + 3, 4, "Temperature: ");
+    clrtoeol();
+    mvprintw(status_row + 3, 4, "Temperature: ");
     if (has_colors()) {
         if (temp_c < 60) wattron(stdscr, COLOR_PAIR(1) | A_BOLD);
         else if (temp_c < 80) wattron(stdscr, COLOR_PAIR(2) | A_BOLD);
@@ -566,27 +661,29 @@ void draw_ui(int temp_c, int speed) {
             wprintw(stdscr, "(Max: %.1f°F)", display_max);
         else
             wprintw(stdscr, "(Max: %.1f°C)", display_max);
+        clrtoeol();
     }
 
-    mvprintw(info_row + 4, 4, "Fan Speed: ");
+    mvprintw(status_row + 4, 4, "Fan Speed: ");
     if (has_colors()) {
         if (speed < 40) wattron(stdscr, COLOR_PAIR(1) | A_BOLD);
         else if (speed < 70) wattron(stdscr, COLOR_PAIR(2) | A_BOLD);
         else wattron(stdscr, COLOR_PAIR(3) | A_BOLD);
     }
     wprintw(stdscr, "%d%%", speed);
+    clrtoeol();
     if (has_colors())
         wattroff(stdscr, COLOR_PAIR(1) | COLOR_PAIR(2) | COLOR_PAIR(3) | A_BOLD);
 
     time_t now = time(NULL);
     int elapsed = (int)(now - start_time);
-    mvprintw(info_row + 4, 30, "Runtime: %02d:%02d:%02d", 
+    mvprintw(status_row + 4, 30, "Runtime: %02d:%02d:%02d", 
              elapsed / 3600, (elapsed % 3600) / 60, elapsed % 60);
-
+    clrtoeol();
     int bar_width = max_x - 22;
     if (bar_width > 60) bar_width = 60;
 
-    int bar_row = info_row + 6;
+    int bar_row = status_row + 6;
     
     move(bar_row, 0);
     clrtoeol();
@@ -629,13 +726,17 @@ void draw_ui(int temp_c, int speed) {
     if (has_colors())
         wattroff(stdscr, COLOR_PAIR(1) | COLOR_PAIR(2) | COLOR_PAIR(3));
 
+    for (int i = 0; i < 10; i++) {
+        move(bar_row + 4 + i, 4);
+        clrtoeol();
+    }
     draw_curve_info(stdscr, bar_row + 4, 4, temp_c);
 
     int control_col = max_x > 80 ? 46 : 4;
     int control_row = max_x > 80 ? bar_row + 4 : bar_row + 14;
     draw_controls(stdscr, control_row, control_col);
 
-    if (!overdrive_available && gpu_generation >= GEN_RDNA3) {
+    if (!g->overdrive_available && g->gpu_generation >= GEN_RDNA3) {
         wattron(stdscr, COLOR_PAIR(3) | A_BOLD);
         int warn_row = max_y - 2;
         mvprintw(warn_row, 2, "RDNA3 requires amdgpu.ppfeaturemask=0xffffffff for manual control.");
@@ -651,42 +752,43 @@ int main() {
     signal(SIGTERM, handle_exit);
     atexit(restore_fan_auto);
 
-    if (!detect_amd_gpu()) {
+    if (!detect_amd_gpus()) {
         printf("[CAGT] No AMD GPU found.\n");
         return 1;
     }
 
     detect_driver();
-    detect_capabilities();
+    sync_globals_from_gpu(0);
     start_time = time(NULL);
 
-    printf("[CAGT] GPU: %s\n", gpu_name);
+    printf("[CAGT] Found %d AMD GPU(s)\n", gpu_count);
+    for (int i = 0; i < gpu_count; i++) {
+        printf("[CAGT] GPU %d: %s\n", i + 1, gpus[i].gpu_name);
+        if (gpus[i].fan_curve_available) printf("[CAGT]   Using fan_curve interface (RDNA3+)\n");
+        printf("[CAGT]   Fans detected: %d\n", gpus[i].fan_count);
+    }
     printf("[CAGT] Driver: %s\n", driver_name);
-    if (fan_curve_available) printf("[CAGT] Using fan_curve interface (RDNA3+)\n");
-    if (!overdrive_available && gpu_generation >= GEN_RDNA3)
-        printf("[CAGT] WARNING: Overdrive not enabled. Set amdgpu.ppfeaturemask=0xffffffff\n");
-    printf("[CAGT] Fans detected: %d\n", fan_count);
+    if (!overdrive_available && gpus[0].gpu_generation >= GEN_RDNA3)
+        printf("[CAGT] WARNING: Overdrive not enabled on some GPUs.\n");
     printf("[CAGT] Starting TUI...\n");
     sleep(1);
 
-    if (!fan_curve_available) set_fan_manual_all();
-    else set_fan_manual();
+    for (int i = 0; i < gpu_count; i++) {
+        set_fan_manual_all_gpu(&gpus[i]);
+    }
 
-    if (!fan_curve_available) {
+    int any_writable = 0;
+    for (int i = 0; i < gpu_count; i++) {
+        if (gpus[i].fan_curve_available) { any_writable = 1; continue; }
         char perm_test[300];
-        snprintf(perm_test, sizeof(perm_test), "%s/pwm1", hwmon_path);
+        snprintf(perm_test, sizeof(perm_test), "%s/pwm1", gpus[i].hwmon_path);
         FILE *pt = fopen(perm_test, "w");
-        if (!pt) {
-            char od_test[300];
-            snprintf(od_test, sizeof(od_test), "%s/gpu_od/fan_curve", hwmon_path);
-            pt = fopen(od_test, "w");
-            if (!pt) {
-                printf("[CAGT] Cannot write to hwmon — permission denied.\n");
-                printf("[CAGT] Run with: sudo ./cagt\n");
-                return 1;
-            }
-        }
-        fclose(pt);
+        if (pt) { any_writable = 1; fclose(pt); }
+    }
+    if (!any_writable) {
+        printf("[CAGT] Cannot write to any GPU hwmon — permission denied.\n");
+        printf("[CAGT] Run with: sudo ./cagt\n");
+        return 1;
     }
 
     initscr();
@@ -719,6 +821,15 @@ int main() {
         draw_ui(temp_c, speed);
 
         int ch = getch();
+        if (ch >= '1' && ch <= '9' && (ch - '1') < gpu_count) {
+            sync_gpu_from_globals(active_gpu);
+            active_gpu = ch - '1';
+            sync_globals_from_gpu(active_gpu);
+            if (temp_sensor == 1 && !temp2_available) temp_sensor = 0;
+            if (temp_sensor == 2 && !temp3_available) temp_sensor = 0;
+            continue;
+        }
+        
         switch (ch) {
             case 'q': case 'Q': running = 0; break;
             case 'm': case 'M':
@@ -745,16 +856,11 @@ int main() {
             case KEY_DOWN: case KEY_LEFT:
                 if (!manual_mode) { manual_mode = 1; manual_speed = speed; }
                 manual_speed -= 1; break;
-            case '0': if (!manual_mode) manual_mode = 1; manual_speed = 0; break;
-            case '1': if (!manual_mode) manual_mode = 1; manual_speed = 10; break;
-            case '2': if (!manual_mode) manual_mode = 1; manual_speed = 20; break;
-            case '3': if (!manual_mode) manual_mode = 1; manual_speed = 30; break;
-            case '4': if (!manual_mode) manual_mode = 1; manual_speed = 40; break;
-            case '5': if (!manual_mode) manual_mode = 1; manual_speed = 50; break;
-            case '6': if (!manual_mode) manual_mode = 1; manual_speed = 60; break;
-            case '7': if (!manual_mode) manual_mode = 1; manual_speed = 70; break;
-            case '8': if (!manual_mode) manual_mode = 1; manual_speed = 80; break;
-            case '9': if (!manual_mode) manual_mode = 1; manual_speed = 90; break;
+            case '0':
+                if (gpu_count > 1 && active_gpu > 0) break;
+                if (!manual_mode) manual_mode = 1;
+                manual_speed = 0;
+                break;
         }
 
         if (manual_speed > 100) manual_speed = 100;
