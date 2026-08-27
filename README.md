@@ -1,7 +1,3 @@
-Here's the updated README:
-
----
-
 <p align="center">
   <strong>╔══════════════════════════════════════╗</strong><br>
   <strong>║        CAGT — AMD GPU Fan Control    ║</strong><br>
