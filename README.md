@@ -47,6 +47,18 @@ sudo ./cagt --daemon
 
 ---
 
+# Development
+
+If you're modifying CAGT, compile with stricter warnings to catch issues early:
+
+```bash
+gcc -std=c99 -O2 -Wall -Wextra -Wpedantic -Wanalyzer-file-leak -o cagt cagt.c -lncurses
+```
+
+The production build doesn't need these flags, but they help catch bugs during development.
+
+---
+
 # TUI Controls
 
 | Key | Action |
