@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
@@ -14,6 +15,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <limits.h>
 
 #define MAX_GPUS 8
 #define MAX_CURVE_POINTS 12
@@ -140,6 +142,7 @@ static const struct gpu_entry known_gpus[] = {
 
 int read_file_int(const char *path);
 void set_fan_speed(int percent);
+int parse_int(const char *str, int *value);
 
 void get_socket_path(char *buf, int size) {
     snprintf(buf, size, "/tmp/cagt-%d.sock", getuid());
@@ -251,6 +254,16 @@ void write_file_int(const char *path, int value) {
     fclose(f);
 }
 
+int parse_int(const char *str, int *value) {
+    char *endptr;
+    errno = 0;
+    long val = strtol(str, &endptr, 10);
+    if (errno != 0 || endptr == str || *endptr != '\0') return 0;
+    if (val < INT_MIN || val > INT_MAX) return 0;
+    *value = (int)val;
+    return 1;
+}
+
 void detect_capabilities_gpu(GPUState *g) {
     char path[300];
 
@@ -312,7 +325,7 @@ int detect_amd_gpus(void) {
 
         const char *name = NULL;
         for (int i = 0; known_gpus[i].device_id != NULL; i++) {
-            if (strstr(device, known_gpus[i].device_id)) {
+            if (strcmp(device, known_gpus[i].device_id) == 0) {
                 name = known_gpus[i].name;
                 g->gpu_generation = known_gpus[i].generation;
                 break;
@@ -321,7 +334,7 @@ int detect_amd_gpus(void) {
         if (name) strcpy(g->gpu_name, name);
         else snprintf(g->gpu_name, sizeof(g->gpu_name), "AMD GPU (%s)", device);
 
-        snprintf(g->device_path, sizeof(g->device_path), "%s/%s", base, e->d_name);
+        snprintf(g->device_path, sizeof(g->device_path), "%.200s/%.50s", base, e->d_name);
 
         snprintf(path, sizeof(path), "%s/%s/hwmon", base, e->d_name);
         DIR *hd = opendir(path);
@@ -330,16 +343,16 @@ int detect_amd_gpus(void) {
         struct dirent *he;
         while ((he = readdir(hd)) != NULL) {
             if (he->d_name[0] == '.') continue;
-            snprintf(g->hwmon_path, sizeof(g->hwmon_path), "%s/%s", path, he->d_name);
+            snprintf(g->hwmon_path, sizeof(g->hwmon_path), "%.200s/%.50s", path, he->d_name);
             break;
         }
         closedir(hd);
         if (g->hwmon_path[0] == '\0') continue;
 
         const char *short_name_src = name ? name : g->gpu_name;
-        char *dash = strrchr(short_name_src, ' ');
+        const char *dash = strrchr(short_name_src, ' ');
         if (dash && strstr(dash + 1, "(")) {
-            char *paren = strchr(dash + 1, '(');
+            const char *paren = strchr(dash + 1, '(');
             if (paren) {
                 size_t len = paren - (dash + 1);
                 if (len < sizeof(g->short_name)) {
@@ -392,6 +405,10 @@ void set_fan_speed(int percent) {
     GPUState *g = &gpus[active_gpu];
 
     if (g->fan_curve_available) {
+        char enable_path[300];
+        snprintf(enable_path, sizeof(enable_path), "%s/pwm1_enable", g->hwmon_path);
+        write_file_int(enable_path, 1);
+
         char path[300];
         snprintf(path, sizeof(path), "%s/gpu_od/fan_curve", g->hwmon_path);
         FILE *f = fopen(path, "w");
@@ -538,6 +555,8 @@ void load_custom_curve(void) {
         if (line[0] == '#' || line[0] == '\n') continue;
         int temp, fan;
         if (sscanf(line, "%d %d", &temp, &fan) == 2) {
+            if (temp < 0 || temp > 120) continue;
+            if (fan < 0 || fan > 100) continue;
             custom_curve[custom_curve_points_count][0] = temp;
             custom_curve[custom_curve_points_count][1] = fan;
             custom_curve_points_count++;
@@ -719,7 +738,11 @@ int create_control_socket(void) {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+    if (strlen(socket_path) >= sizeof(addr.sun_path)) {
+        fprintf(stderr, "[CAGT] Socket path too long\n");
+        return -1;
+    }
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
 
     if (bind(socket_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(socket_fd);
@@ -804,7 +827,11 @@ void handle_client_command(int client_fd, char *cmd) {
     }
     else if (strncmp(cmd, "gpu ", 4) == 0) {
         char *arg = cmd + 4;
-        int new_gpu = atoi(arg);
+        int new_gpu;
+        if (!parse_int(arg, &new_gpu)) {
+            send_response(client_fd, "ERROR invalid GPU index\n");
+            return;
+        }
         if (new_gpu >= 1 && new_gpu <= gpu_count) {
             sync_gpu_from_globals(active_gpu);
             active_gpu = new_gpu - 1;
@@ -829,7 +856,11 @@ void handle_client_command(int client_fd, char *cmd) {
             send_response(client_fd, "OK mode=gpu (GPU hardware controls fan)\n");
         }
         else {
-            int new_speed = atoi(arg);
+            int new_speed;
+            if (!parse_int(arg, &new_speed)) {
+                send_response(client_fd, "ERROR speed must be a number 0-100\n");
+                return;
+            }
             if (new_speed < 0 || new_speed > 100) {
                 send_response(client_fd, "ERROR speed must be 0-100\n");
             } else {
@@ -854,7 +885,10 @@ void handle_client_command(int client_fd, char *cmd) {
             else if (strcmp(arg, "aggressive") == 0) new_curve = 2;
             else if (strcmp(arg, "linear") == 0) new_curve = 3;
             else if (strcmp(arg, "custom") == 0) new_curve = 4;
-            else new_curve = atoi(arg);
+            else if (!parse_int(arg, &new_curve)) {
+                send_response(client_fd, "ERROR invalid curve\n");
+                return;
+            }
 
             if (new_curve < 0 || new_curve > 4) {
                 send_response(client_fd, "ERROR curve must be default, quiet, aggressive, linear, custom, or 0-4\n");
@@ -879,15 +913,38 @@ void handle_client_command(int client_fd, char *cmd) {
         int len = strlen(arg);
 
         if (len > 2 && arg[len-2] == 'm' && arg[len-1] == 's') {
-            arg[len-2] = 0;
-            ms = atoi(arg);
+            char num_str[32];
+            if (len - 2 >= (int)sizeof(num_str)) {
+                send_response(client_fd, "ERROR invalid interval\n");
+                return;
+            }
+            memcpy(num_str, arg, len - 2);
+            num_str[len - 2] = 0;
+            if (!parse_int(num_str, &ms)) {
+                send_response(client_fd, "ERROR invalid interval\n");
+                return;
+            }
         }
         else if (len > 1 && arg[len-1] == 's') {
-            arg[len-1] = 0;
-            ms = atoi(arg) * 1000;
+            char num_str[32];
+            if (len - 1 >= (int)sizeof(num_str)) {
+                send_response(client_fd, "ERROR invalid interval\n");
+                return;
+            }
+            memcpy(num_str, arg, len - 1);
+            num_str[len - 1] = 0;
+            int seconds;
+            if (!parse_int(num_str, &seconds)) {
+                send_response(client_fd, "ERROR invalid interval\n");
+                return;
+            }
+            ms = seconds * 1000;
         }
         else {
-            ms = atoi(arg);
+            if (!parse_int(arg, &ms)) {
+                send_response(client_fd, "ERROR invalid interval\n");
+                return;
+            }
         }
 
         if (ms > 0) {
@@ -947,18 +1004,35 @@ void poll_control_socket(void) {
     int client_fd = accept(socket_fd, NULL, NULL);
     if (client_fd < 0) return;
 
-    char buffer[256];
+    struct ucred cred;
+    socklen_t cred_len = sizeof(cred);
+    if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) == 0) {
+        if (cred.uid != getuid()) {
+            send_response(client_fd, "ERROR: Access denied\n");
+            close(client_fd);
+            return;
+        }
+    } else {
+        close(client_fd);
+        return;
+    }
+
+    char buffer[512];
+    int total = 0;
     fd_set client_read;
     FD_ZERO(&client_read);
     FD_SET(client_fd, &client_read);
 
     struct timeval client_timeout = {1, 0};
     if (select(client_fd + 1, &client_read, NULL, NULL, &client_timeout) > 0) {
-        int n = read(client_fd, buffer, sizeof(buffer) - 1);
-        if (n > 0) {
-            buffer[n] = 0;
-            handle_client_command(client_fd, buffer);
+        while (total < (int)sizeof(buffer) - 1) {
+            int n = read(client_fd, buffer + total, sizeof(buffer) - 1 - total);
+            if (n <= 0) break;
+            total += n;
+            if (memchr(buffer, '\n', total)) break;
         }
+        buffer[total] = 0;
+        handle_client_command(client_fd, buffer);
     }
 
     close(client_fd);
@@ -974,7 +1048,11 @@ int send_command_to_daemon(int argc, char *argv[]) {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+    if (strlen(socket_path) >= sizeof(addr.sun_path)) {
+        fprintf(stderr, "[CAGT] Socket path too long\n");
+        return -1;
+    }
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         printf("[CAGT] Daemon not running (no socket at %s)\n", socket_path);
@@ -982,12 +1060,19 @@ int send_command_to_daemon(int argc, char *argv[]) {
         return 1;
     }
 
-    char cmd[256] = {0};
+    char cmd[512] = {0};
+    int offset = 0;
     for (int i = 0; i < argc; i++) {
-        if (i > 0) strcat(cmd, " ");
-        strcat(cmd, argv[i]);
+        int written = snprintf(cmd + offset, sizeof(cmd) - offset, "%s%s",
+                               (i > 0) ? " " : "", argv[i]);
+        if (written < 0 || offset + written >= (int)sizeof(cmd)) {
+            fprintf(stderr, "[CAGT] Command too long\n");
+            close(fd);
+            return 1;
+        }
+        offset += written;
     }
-    strcat(cmd, "\n");
+    snprintf(cmd + offset, sizeof(cmd) - offset, "\n");
 
     write(fd, cmd, strlen(cmd));
 
@@ -1190,7 +1275,7 @@ void draw_ui(int temp_c, int speed) {
     if (restore_failed) {
         wattron(stdscr, COLOR_PAIR(3) | A_BOLD);
         mvprintw(info_row + 5, 4, "WARNING: Auto fan restore may have failed! Reboot to recover.");
-        wattroff(stdscr, COLOR_PAIR(3) | A_BOLD);
+        wattrset(stdscr, A_NORMAL);
         info_row++;
     }
 
@@ -1205,13 +1290,13 @@ void draw_ui(int temp_c, int speed) {
     mvprintw(status_row + 1, 4, "Mode: ");
     if (has_colors()) wattron(stdscr, COLOR_PAIR(mode_color) | A_BOLD);
     wprintw(stdscr, "%s", manual_mode ? "MANUAL" : "AUTO (curve)");
-    if (has_colors()) wattroff(stdscr, COLOR_PAIR(mode_color) | A_BOLD);
+    if (has_colors()) wattrset(stdscr, A_NORMAL);
 
     GPUState *g = &gpus[active_gpu];
     if (!g->overdrive_available && g->gpu_generation >= GEN_RDNA3) {
         wattron(stdscr, COLOR_PAIR(3));
         wprintw(stdscr, "  [Overdrive not enabled!]");
-        wattroff(stdscr, COLOR_PAIR(3));
+        wattrset(stdscr, A_NORMAL);
     }
 
     if (zero_rpm_active) {
@@ -1237,7 +1322,7 @@ void draw_ui(int temp_c, int speed) {
     else
         wprintw(stdscr, "%.1f°C ", display_temp);
     if (has_colors())
-        wattroff(stdscr, COLOR_PAIR(1) | COLOR_PAIR(2) | COLOR_PAIR(3) | A_BOLD);
+        wattrset(stdscr, A_NORMAL);
 
     if (max_temp_c > 0) {
         double display_max = convert_temp(max_temp_c);
@@ -1259,7 +1344,7 @@ void draw_ui(int temp_c, int speed) {
     wprintw(stdscr, "%d%%", speed);
     clrtoeol();
     if (has_colors())
-        wattroff(stdscr, COLOR_PAIR(1) | COLOR_PAIR(2) | COLOR_PAIR(3) | A_BOLD);
+        wattrset(stdscr, A_NORMAL);
 
     time_t now = time(NULL);
     int elapsed = (int)(now - start_time);
@@ -1281,7 +1366,7 @@ void draw_ui(int temp_c, int speed) {
     }
     draw_bar(stdscr, bar_row, 4, bar_width, (double)speed, 100.0, "Fan   ", "%");
     if (has_colors())
-        wattroff(stdscr, COLOR_PAIR(1) | COLOR_PAIR(2) | COLOR_PAIR(3));
+        wattrset(stdscr, A_NORMAL);
 
     double temp_max;
     switch (temp_unit) {
@@ -1311,7 +1396,7 @@ void draw_ui(int temp_c, int speed) {
     }
     draw_bar(stdscr, bar_row + 2, 4, bar_width, temp_display, temp_max, temp_bar_label, "");
     if (has_colors())
-        wattroff(stdscr, COLOR_PAIR(1) | COLOR_PAIR(2) | COLOR_PAIR(3));
+        wattrset(stdscr, A_NORMAL);
 
     for (int i = 0; i < 14; i++) {
         move(bar_row + 4 + i, 4);
@@ -1333,7 +1418,7 @@ void draw_ui(int temp_c, int speed) {
         } else {
             mvprintw(warn_row, 2, "Overdrive unavailable despite ppfeaturemask - check kernel version.");
         }
-        wattroff(stdscr, COLOR_PAIR(3) | A_BOLD);
+        wattrset(stdscr, A_NORMAL);
     }
 
     refresh();
@@ -1456,7 +1541,7 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < gpu_count; i++) {
         if (gpus[i].fan_curve_available) { any_writable = 1; continue; }
         char perm_test[300];
-        snprintf(perm_test, sizeof(perm_test), "%s/pwm1", gpus[i].hwmon_path);
+        snprintf(perm_test, sizeof(perm_test), "%.250s/pwm1", gpus[i].hwmon_path);
         FILE *pt = fopen(perm_test, "w");
         if (pt) { any_writable = 1; fclose(pt); }
     }
@@ -1561,6 +1646,11 @@ int main(int argc, char *argv[]) {
             case '0':
                 if (!manual_mode) manual_mode = 1;
                 manual_speed = 0;
+                break;
+            case KEY_RESIZE:
+                endwin();
+                refresh();
+                clearok(stdscr, TRUE);
                 break;
         }
 

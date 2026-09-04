@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v1.3.0-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-v1.3.1-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/Language-C-A8B9CC?style=flat-square&logo=c" alt="C">
   <img src="https://img.shields.io/badge/TUI-ncurses-FFB6C1?style=flat-square" alt="ncurses">
   <img src="https://img.shields.io/badge/License-IRX_1.0-yellow?style=flat-square" alt="License">
