@@ -1,9 +1,9 @@
 # Contributing to CAGT
 
 CAGT welcomes contributions from anyone, provided they fall within a
-reasonable scope aligned with the project's goals: a single-file,
-ncurses-based AMD GPU fan controller with zero external dependencies
-beyond standard C and ncurses.
+reasonable scope aligned with the project's goals: a single-file AMD GPU
+fan controller with a ncurses TUI and optional daemon mode, with zero
+external dependencies beyond standard C and ncurses.
 
 ## Project Philosophy
 
@@ -30,6 +30,8 @@ At minimum, contributors should verify:
 - Fan speed changes take effect
 - Exiting (Q, Ctrl+C, SIGTERM) restores auto fan control
 - Manual mode toggles and adjustments behave as expected
+- Daemon mode starts and responds to CLI commands
+- Logging works when enabled
 
 ## Pull Requests and Code Contributions
 

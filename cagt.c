@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,8 +8,15 @@
 #include <signal.h>
 #include <ncurses.h>
 #include <time.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/select.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #define MAX_GPUS 8
+#define MAX_CURVE_POINTS 12
 
 static char hwmon_path[256];
 static char gpu_name[128] = "Unknown AMD GPU";
@@ -30,7 +39,7 @@ static int fan_count = 1;
 static int fan_rpm_available = 0;
 
 static int curve_profile = 0;
-static const char *curve_profile_names[] = {"Default", "Quiet", "Aggressive", "Linear"};
+static const char *curve_profile_names[] = {"Default", "Quiet", "Aggressive", "Linear", "Custom"};
 
 static int max_temp_c = 0;
 static time_t start_time;
@@ -43,6 +52,21 @@ static int restore_failed = 0;
 
 static int gpu_count = 0;
 static int active_gpu = 0;
+
+static int daemon_mode = 0;
+static int logging_enabled = 0;
+static int log_interval_ms = 1000;
+static FILE *log_file = NULL;
+static int socket_fd = -1;
+
+static int custom_curve_points_count = 0;
+static int custom_curve[MAX_CURVE_POINTS][2];
+
+static int saved_manual_mode[MAX_GPUS];
+static int saved_manual_speed[MAX_GPUS];
+static int saved_curve_profile[MAX_GPUS];
+static int saved_temp_sensor[MAX_GPUS];
+static int saved_temp_unit[MAX_GPUS];
 
 typedef struct {
     char hwmon_path[256];
@@ -115,6 +139,11 @@ static const struct gpu_entry known_gpus[] = {
 };
 
 int read_file_int(const char *path);
+void set_fan_speed(int percent);
+
+void get_socket_path(char *buf, int size) {
+    snprintf(buf, size, "/tmp/cagt-%d.sock", getuid());
+}
 
 void sync_globals_from_gpu(int idx) {
     GPUState *g = &gpus[idx];
@@ -148,45 +177,45 @@ void sync_gpu_from_globals(int idx) {
 
 void restore_fan_auto_gpu(GPUState *g) {
     if (g->hwmon_path[0] == '\0') return;
-    
+
     if (g->fan_curve_available) {
         char path[300];
         snprintf(path, sizeof(path), "%s/gpu_od/fan_curve", g->hwmon_path);
         FILE *f = fopen(path, "w");
         if (f) { fprintf(f, "c"); fclose(f); return; }
     }
-    
+
     char path[300];
     snprintf(path, sizeof(path), "%s/pwm1_enable", g->hwmon_path);
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "2");
     fclose(f);
-    
+
     int actual = read_file_int(path);
     if (actual == 2) return;
-    
+
     f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "1");
     fclose(f);
-    
+
     char pwm_path[300];
     snprintf(pwm_path, sizeof(pwm_path), "%s/pwm1", g->hwmon_path);
     f = fopen(pwm_path, "w");
     if (f) { fprintf(f, "%d", (50 * 255) / 100); fclose(f); }
-    
+
     snprintf(path, sizeof(path), "%s/pwm1_enable", g->hwmon_path);
     f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "2");
     fclose(f);
-    
+
     actual = read_file_int(path);
     if (actual != 2) g->restore_failed = 1;
 }
 
-void restore_fan_auto() {
+void restore_fan_auto(void) {
     for (int i = 0; i < gpu_count; i++) restore_fan_auto_gpu(&gpus[i]);
     if (gpu_count > 0) restore_failed = gpus[active_gpu].restore_failed;
 }
@@ -224,28 +253,28 @@ void write_file_int(const char *path, int value) {
 
 void detect_capabilities_gpu(GPUState *g) {
     char path[300];
-    
+
     snprintf(path, sizeof(path), "%s/pwm1", g->hwmon_path);
     FILE *f = fopen(path, "w");
     if (f) { g->pwm_writable = 1; fclose(f); }
-    
+
     snprintf(path, sizeof(path), "%s/gpu_od/fan_curve", g->hwmon_path);
     f = fopen(path, "r");
     if (f) { g->fan_curve_available = 1; fclose(f); }
-    
+
     snprintf(path, sizeof(path), "%s/../pp_od_clk_voltage", g->hwmon_path);
     f = fopen(path, "w");
     if (f) { g->overdrive_available = 1; fclose(f); }
-    
+
     snprintf(path, sizeof(path), "%s/temp2_input", g->hwmon_path);
     if (read_file_int(path) >= 0) g->temp2_available = 1;
-    
+
     snprintf(path, sizeof(path), "%s/temp3_input", g->hwmon_path);
     if (read_file_int(path) >= 0) g->temp3_available = 1;
-    
+
     snprintf(path, sizeof(path), "%s/fan1_input", g->hwmon_path);
     if (read_file_int(path) >= 0) g->fan_rpm_available = 1;
-    
+
     g->fan_count = 1;
     for (int i = 2; i <= 4; i++) {
         snprintf(path, sizeof(path), "%s/pwm%d", g->hwmon_path, i);
@@ -256,7 +285,7 @@ void detect_capabilities_gpu(GPUState *g) {
     }
 }
 
-int detect_amd_gpus() {
+int detect_amd_gpus(void) {
     const char *base = "/sys/bus/pci/devices";
     DIR *d = opendir(base);
     if (!d) return 0;
@@ -307,7 +336,8 @@ int detect_amd_gpus() {
         closedir(hd);
         if (g->hwmon_path[0] == '\0') continue;
 
-        char *dash = strrchr(name ? name : g->gpu_name, ' ');
+        const char *short_name_src = name ? name : g->gpu_name;
+        char *dash = strrchr(short_name_src, ' ');
         if (dash && strstr(dash + 1, "(")) {
             char *paren = strchr(dash + 1, '(');
             if (paren) {
@@ -331,7 +361,7 @@ int detect_amd_gpus() {
     return gpu_count;
 }
 
-void detect_driver() {
+void detect_driver(void) {
     FILE *f = fopen("/proc/modules", "r");
     if (!f) { strcpy(driver_name, "unknown"); return; }
     char line[256];
@@ -346,16 +376,6 @@ void detect_driver() {
     else strcpy(driver_name, "unknown");
 }
 
-void set_fan_manual_all() {
-    GPUState *g = &gpus[active_gpu];
-    if (g->fan_curve_available) return;
-    for (int i = 1; i <= g->fan_count; i++) {
-        char path[300];
-        snprintf(path, sizeof(path), "%s/pwm%d_enable", g->hwmon_path, i);
-        write_file_int(path, 1);
-    }
-}
-
 void set_fan_manual_all_gpu(GPUState *g) {
     if (g->fan_curve_available) return;
     for (int i = 1; i <= g->fan_count; i++) {
@@ -368,9 +388,9 @@ void set_fan_manual_all_gpu(GPUState *g) {
 void set_fan_speed(int percent) {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
-    
+
     GPUState *g = &gpus[active_gpu];
-    
+
     if (g->fan_curve_available) {
         char path[300];
         snprintf(path, sizeof(path), "%s/gpu_od/fan_curve", g->hwmon_path);
@@ -385,7 +405,9 @@ void set_fan_speed(int percent) {
         fclose(f);
         return;
     }
-    
+
+    set_fan_manual_all_gpu(g);
+
     for (int i = 1; i <= g->fan_count; i++) {
         char path[300];
         snprintf(path, sizeof(path), "%s/pwm%d", g->hwmon_path, i);
@@ -404,6 +426,23 @@ double convert_temp(int celsius) {
 }
 
 int fan_curve(int temp) {
+    if (curve_profile == 4 && custom_curve_points_count >= 2) {
+        if (temp <= custom_curve[0][0]) return custom_curve[0][1];
+        if (temp >= custom_curve[custom_curve_points_count-1][0])
+            return custom_curve[custom_curve_points_count-1][1];
+
+        for (int i = 0; i < custom_curve_points_count - 1; i++) {
+            if (temp >= custom_curve[i][0] && temp <= custom_curve[i+1][0]) {
+                int t0 = custom_curve[i][0];
+                int t1 = custom_curve[i+1][0];
+                int f0 = custom_curve[i][1];
+                int f1 = custom_curve[i+1][1];
+                return f0 + (f1 - f0) * (temp - t0) / (t1 - t0);
+            }
+        }
+        return 100;
+    }
+
     int points_default[][2] = {
         {20, 0}, {35, 20}, {50, 30}, {60, 45},
         {70, 60}, {80, 75}, {90, 90}, {100, 100}
@@ -419,10 +458,10 @@ int fan_curve(int temp) {
     int points_linear[][2] = {
         {20, 0}, {100, 100}
     };
-    
+
     int (*points)[2];
     int n;
-    
+
     switch (curve_profile) {
         case 1: points = points_quiet; n = 8; break;
         case 2: points = points_aggressive; n = 8; break;
@@ -446,7 +485,7 @@ int fan_curve(int temp) {
     return 100;
 }
 
-int get_temp() {
+int get_temp(void) {
     GPUState *g = &gpus[active_gpu];
     char path[300];
     int sensor_idx = temp_sensor + 1;
@@ -460,7 +499,7 @@ int get_temp() {
     return t / 1000;
 }
 
-int get_fan_rpm() {
+int get_fan_rpm(void) {
     GPUState *g = &gpus[active_gpu];
     if (!g->fan_rpm_available) return -1;
     char path[300];
@@ -468,11 +507,11 @@ int get_fan_rpm() {
     return read_file_int(path);
 }
 
-void detect_zero_rpm() {
+void detect_zero_rpm(void) {
     GPUState *g = &gpus[active_gpu];
     g->zero_rpm_active = 0;
     if (g->fan_curve_available) return;
-    
+
     int temp = get_temp();
     int rpm = get_fan_rpm();
     if (temp > 0 && temp < 55 && rpm == 0) {
@@ -482,6 +521,546 @@ void detect_zero_rpm() {
         if (enable == 2) g->zero_rpm_active = 1;
     }
     zero_rpm_active = g->zero_rpm_active;
+}
+
+void load_custom_curve(void) {
+    const char *home = getenv("HOME");
+    if (!home) return;
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/.config/cagt/custom_curve.conf", home);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    custom_curve_points_count = 0;
+    char line[128];
+    while (fgets(line, sizeof(line), f) && custom_curve_points_count < MAX_CURVE_POINTS) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        int temp, fan;
+        if (sscanf(line, "%d %d", &temp, &fan) == 2) {
+            custom_curve[custom_curve_points_count][0] = temp;
+            custom_curve[custom_curve_points_count][1] = fan;
+            custom_curve_points_count++;
+        }
+    }
+    fclose(f);
+
+    if (custom_curve_points_count < 2) {
+        custom_curve_points_count = 0;
+        return;
+    }
+
+    for (int i = 1; i < custom_curve_points_count; i++) {
+        if (custom_curve[i][0] <= custom_curve[i-1][0]) {
+            custom_curve_points_count = 0;
+            return;
+        }
+    }
+}
+
+void load_settings(void) {
+    for (int i = 0; i < MAX_GPUS; i++) {
+        saved_manual_mode[i] = 0;
+        saved_manual_speed[i] = 50;
+        saved_curve_profile[i] = 0;
+        saved_temp_sensor[i] = 0;
+        saved_temp_unit[i] = 0;
+    }
+
+    const char *home = getenv("HOME");
+    if (!home) return;
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/.config/cagt/config.conf", home);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    int current_gpu = -1;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '[') {
+            if (sscanf(line, "[gpu%d]", &current_gpu) != 1 || current_gpu < 0 || current_gpu >= MAX_GPUS) {
+                current_gpu = -1;
+            }
+        } else if (current_gpu >= 0) {
+            char key[64];
+            int value;
+            if (sscanf(line, "%63[^=]=%d", key, &value) == 2) {
+                if (strcmp(key, "manual_mode") == 0)
+                    saved_manual_mode[current_gpu] = value;
+                else if (strcmp(key, "manual_speed") == 0)
+                    saved_manual_speed[current_gpu] = value;
+                else if (strcmp(key, "curve_profile") == 0)
+                    saved_curve_profile[current_gpu] = value;
+                else if (strcmp(key, "temp_sensor") == 0)
+                    saved_temp_sensor[current_gpu] = value;
+                else if (strcmp(key, "temp_unit") == 0)
+                    saved_temp_unit[current_gpu] = value;
+            }
+        }
+    }
+    fclose(f);
+}
+
+void save_settings(void) {
+    const char *home = getenv("HOME");
+    if (!home) return;
+
+    char dir_path[512];
+    snprintf(dir_path, sizeof(dir_path), "%s/.config/cagt", home);
+    mkdir(dir_path, 0755);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/.config/cagt/config.conf", home);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+
+    fprintf(f, "# CAGT configuration - auto-generated\n\n");
+    for (int i = 0; i < gpu_count; i++) {
+        if (i == active_gpu) {
+            saved_manual_mode[i] = manual_mode;
+            saved_manual_speed[i] = manual_speed;
+            saved_curve_profile[i] = curve_profile;
+            saved_temp_sensor[i] = temp_sensor;
+            saved_temp_unit[i] = temp_unit;
+        }
+
+        fprintf(f, "[gpu%d]\n", i);
+        fprintf(f, "manual_mode=%d\n", saved_manual_mode[i]);
+        fprintf(f, "manual_speed=%d\n", saved_manual_speed[i]);
+        fprintf(f, "curve_profile=%d\n", saved_curve_profile[i]);
+        fprintf(f, "temp_sensor=%d\n", saved_temp_sensor[i]);
+        fprintf(f, "temp_unit=%d\n", saved_temp_unit[i]);
+        fprintf(f, "\n");
+    }
+    fclose(f);
+}
+
+int init_logging(void) {
+    const char *home = getenv("HOME");
+    if (!home) return 0;
+
+    char path[512];
+    
+    snprintf(path, sizeof(path), "%s/.local", home);
+    mkdir(path, 0755);
+    
+    snprintf(path, sizeof(path), "%s/.local/share", home);
+    mkdir(path, 0755);
+    
+    snprintf(path, sizeof(path), "%s/.local/share/cagt", home);
+    mkdir(path, 0755);
+
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm);
+
+    snprintf(path, sizeof(path), "%s/.local/share/cagt/fanlog_%s.csv", home, timestamp);
+    log_file = fopen(path, "w");
+    if (!log_file) return 0;
+
+    fprintf(log_file, "timestamp,temp_c,fan_percent,fan_rpm,profile,manual_mode,gpu\n");
+    return 1;
+}
+
+void log_sample(int temp_c, int speed, int gpu_index) {
+    if (!logging_enabled || !log_file) return;
+
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm);
+
+    int rpm = get_fan_rpm();
+
+    fprintf(log_file, "%s,%d,%d,%d,%s,%d,%d\n",
+            timestamp, temp_c, speed, rpm,
+            curve_profile_names[curve_profile], manual_mode, gpu_index);
+    fflush(log_file);
+}
+
+void close_logging(void) {
+    if (log_file) {
+        fclose(log_file);
+        log_file = NULL;
+    }
+    logging_enabled = 0;
+}
+
+void check_ppfeaturemask(void) {
+    int needs_od = 0;
+    for (int i = 0; i < gpu_count; i++) {
+        if (gpus[i].gpu_generation >= GEN_RDNA3 && !gpus[i].overdrive_available) {
+            needs_od = 1;
+            break;
+        }
+    }
+    if (!needs_od) return;
+
+    int mask = read_file_int("/sys/module/amdgpu/parameters/ppfeaturemask");
+    if (mask >= 0 && (mask & 0x4000) == 0) {
+        printf("[CAGT] WARNING: amdgpu.ppfeaturemask=%#x\n", mask);
+        printf("[CAGT] Overdrive bit (0x4000) is disabled.\n");
+        printf("[CAGT] Manual fan control may not work on RDNA3+.\n");
+        printf("[CAGT] Add 'amdgpu.ppfeaturemask=0xffffffff' to kernel cmdline.\n");
+    }
+}
+
+int create_control_socket(void) {
+    char socket_path[128];
+    get_socket_path(socket_path, sizeof(socket_path));
+
+    unlink(socket_path);
+
+    socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (socket_fd < 0) return -1;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+
+    if (bind(socket_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(socket_fd);
+        socket_fd = -1;
+        return -1;
+    }
+
+    if (listen(socket_fd, 8) < 0) {
+        close(socket_fd);
+        unlink(socket_path);
+        socket_fd = -1;
+        return -1;
+    }
+
+    int flags = fcntl(socket_fd, F_GETFL, 0);
+    fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK);
+
+    chmod(socket_path, 0600);
+    return 0;
+}
+
+void cleanup_socket(void) {
+    if (socket_fd >= 0) {
+        close(socket_fd);
+        socket_fd = -1;
+    }
+    char socket_path[128];
+    get_socket_path(socket_path, sizeof(socket_path));
+    unlink(socket_path);
+}
+
+void send_response(int client_fd, const char *response) {
+    write(client_fd, response, strlen(response));
+}
+
+void handle_client_command(int client_fd, char *cmd) {
+    cmd[strcspn(cmd, "\n")] = 0;
+
+    if (strcmp(cmd, "status") == 0) {
+        if (gpu_count > 1) {
+            char response[512];
+            int offset = 0;
+            for (int i = 0; i < gpu_count; i++) {
+                int old_active = active_gpu;
+                active_gpu = i;
+                sync_globals_from_gpu(i);
+                
+                int temp = get_temp();
+                int rpm = get_fan_rpm();
+                int current_speed;
+                if (manual_mode) current_speed = manual_speed;
+                else current_speed = fan_curve(temp);
+                
+                offset += snprintf(response + offset, sizeof(response) - offset,
+                         "GPU %d [%s]: temp=%d fan=%d%% (%d RPM) mode=%s profile=%s%s\n",
+                         i + 1, gpus[i].short_name, temp, current_speed, rpm,
+                         manual_mode ? "manual" : "curve",
+                         curve_profile_names[curve_profile],
+                         (i == old_active) ? " [active]" : "");
+                
+                sync_gpu_from_globals(i);
+                active_gpu = old_active;
+                sync_globals_from_gpu(old_active);
+            }
+            send_response(client_fd, response);
+        } else {
+            char response[256];
+            int temp = get_temp();
+            int rpm = get_fan_rpm();
+            int current_speed;
+            if (manual_mode) current_speed = manual_speed;
+            else current_speed = fan_curve(temp);
+            
+            snprintf(response, sizeof(response),
+                     "STATUS temp=%d fan=%d%% (%d RPM) mode=%s profile=%s gpu=%d\n",
+                     temp, current_speed, rpm,
+                     manual_mode ? "manual" : "curve",
+                     curve_profile_names[curve_profile],
+                     active_gpu + 1);
+            send_response(client_fd, response);
+        }
+    }
+    else if (strncmp(cmd, "gpu ", 4) == 0) {
+        char *arg = cmd + 4;
+        int new_gpu = atoi(arg);
+        if (new_gpu >= 1 && new_gpu <= gpu_count) {
+            sync_gpu_from_globals(active_gpu);
+            active_gpu = new_gpu - 1;
+            sync_globals_from_gpu(active_gpu);
+            char response[64];
+            snprintf(response, sizeof(response), "OK active gpu=%d (%s)\n", 
+                     active_gpu + 1, gpus[active_gpu].short_name);
+            send_response(client_fd, response);
+        } else {
+            send_response(client_fd, "ERROR invalid GPU index\n");
+        }
+    }
+    else if (strncmp(cmd, "fan ", 4) == 0) {
+        char *arg = cmd + 4;
+
+        if (strcmp(arg, "auto") == 0 || strcmp(arg, "curve") == 0) {
+            manual_mode = 0;
+            send_response(client_fd, "OK mode=curve (CAGT controls fan)\n");
+        }
+        else if (strcmp(arg, "gpu") == 0 || strcmp(arg, "hardware") == 0) {
+            restore_fan_auto();
+            send_response(client_fd, "OK mode=gpu (GPU hardware controls fan)\n");
+        }
+        else {
+            int new_speed = atoi(arg);
+            if (new_speed < 0 || new_speed > 100) {
+                send_response(client_fd, "ERROR speed must be 0-100\n");
+            } else {
+                manual_mode = 1;
+                manual_speed = new_speed;
+                char response[64];
+                snprintf(response, sizeof(response), "OK speed=%d\n", manual_speed);
+                send_response(client_fd, response);
+            }
+        }
+    }
+    else if (strncmp(cmd, "curve ", 6) == 0) {
+        char *arg = cmd + 6;
+
+        if (strcmp(arg, "list") == 0) {
+            send_response(client_fd, "CURVES: default, quiet, aggressive, linear, custom\n");
+        }
+        else {
+            int new_curve = -1;
+            if (strcmp(arg, "default") == 0) new_curve = 0;
+            else if (strcmp(arg, "quiet") == 0) new_curve = 1;
+            else if (strcmp(arg, "aggressive") == 0) new_curve = 2;
+            else if (strcmp(arg, "linear") == 0) new_curve = 3;
+            else if (strcmp(arg, "custom") == 0) new_curve = 4;
+            else new_curve = atoi(arg);
+
+            if (new_curve < 0 || new_curve > 4) {
+                send_response(client_fd, "ERROR curve must be default, quiet, aggressive, linear, custom, or 0-4\n");
+            } else {
+                curve_profile = new_curve;
+                char response[64];
+                snprintf(response, sizeof(response), "OK curve=%s\n", curve_profile_names[curve_profile]);
+                send_response(client_fd, response);
+            }
+        }
+    }
+    else if (strncmp(cmd, "log ", 4) == 0) {
+        char *arg = cmd + 4;
+
+        if (strcmp(arg, "off") == 0 || strcmp(arg, "0") == 0) {
+            logging_enabled = 0;
+            send_response(client_fd, "OK logging disabled\n");
+            return;
+        }
+
+        int ms = 0;
+        int len = strlen(arg);
+
+        if (len > 2 && arg[len-2] == 'm' && arg[len-1] == 's') {
+            arg[len-2] = 0;
+            ms = atoi(arg);
+        }
+        else if (len > 1 && arg[len-1] == 's') {
+            arg[len-1] = 0;
+            ms = atoi(arg) * 1000;
+        }
+        else {
+            ms = atoi(arg);
+        }
+
+        if (ms > 0) {
+            if (!log_file) init_logging();
+            logging_enabled = 1;
+            log_interval_ms = ms;
+            char response[64];
+            if (ms % 1000 == 0) {
+                snprintf(response, sizeof(response), "OK log interval = %ds\n", ms / 1000);
+            } else {
+                snprintf(response, sizeof(response), "OK log interval = %dms\n", ms);
+            }
+            send_response(client_fd, response);
+        } else {
+            send_response(client_fd, "ERROR invalid interval (examples: 1s, 5s, 10s, 500ms, 200)\n");
+        }
+    }
+    else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) {
+        char response[64];
+        snprintf(response, sizeof(response), "CAGT daemon (PID: %d) has quit.\n", getpid());
+        send_response(client_fd, response);
+        running = 0;
+    }
+    else if (strcmp(cmd, "help") == 0) {
+        char response[512];
+        snprintf(response, sizeof(response),
+                 "COMMANDS:\n"
+                 "  status                     Show current state\n"
+                 "  gpu <1-%d>                  Select active GPU\n"
+                 "  fan <0-100>                Set manual fan speed\n"
+                 "  fan auto                   CAGT controls fan via curve\n"
+                 "  fan gpu                    GPU hardware controls fan\n"
+                 "  curve <name|0-4>           Select curve (default, quiet, aggressive, linear, custom)\n"
+                 "  curve list                 List available curves\n"
+                 "  log <1s|5s|10s|500ms|off>  Set logging interval\n"
+                 "  quit                       Stop daemon\n",
+                 gpu_count);
+        send_response(client_fd, response);
+    }
+    else {
+        send_response(client_fd, "ERROR unknown command (try help)\n");
+    }
+}
+
+void poll_control_socket(void) {
+    if (socket_fd < 0) return;
+
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(socket_fd, &readfds);
+
+    struct timeval timeout = {0, 0};
+
+    int ready = select(socket_fd + 1, &readfds, NULL, NULL, &timeout);
+    if (ready <= 0) return;
+
+    int client_fd = accept(socket_fd, NULL, NULL);
+    if (client_fd < 0) return;
+
+    char buffer[256];
+    fd_set client_read;
+    FD_ZERO(&client_read);
+    FD_SET(client_fd, &client_read);
+
+    struct timeval client_timeout = {1, 0};
+    if (select(client_fd + 1, &client_read, NULL, NULL, &client_timeout) > 0) {
+        int n = read(client_fd, buffer, sizeof(buffer) - 1);
+        if (n > 0) {
+            buffer[n] = 0;
+            handle_client_command(client_fd, buffer);
+        }
+    }
+
+    close(client_fd);
+}
+
+int send_command_to_daemon(int argc, char *argv[]) {
+    char socket_path[128];
+    get_socket_path(socket_path, sizeof(socket_path));
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return 1;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        printf("[CAGT] Daemon not running (no socket at %s)\n", socket_path);
+        close(fd);
+        return 1;
+    }
+
+    char cmd[256] = {0};
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) strcat(cmd, " ");
+        strcat(cmd, argv[i]);
+    }
+    strcat(cmd, "\n");
+
+    write(fd, cmd, strlen(cmd));
+
+    char response[512];
+    int n = read(fd, response, sizeof(response) - 1);
+    if (n > 0) {
+        response[n] = 0;
+        printf("%s", response);
+    }
+
+    close(fd);
+    return 0;
+}
+
+void daemonize(void) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        exit(1);
+    }
+    if (pid > 0) {
+        printf("[CAGT] Daemon started with PID %d\n", pid);
+        exit(0);
+    }
+
+    umask(0);
+    setsid();
+
+    freopen("/dev/null", "r", stdin);
+    freopen("/dev/null", "w", stdout);
+    freopen("/dev/null", "w", stderr);
+}
+
+int run_daemon(void) {
+    if (create_control_socket() < 0) {
+        printf("[CAGT] Warning: Could not create control socket\n");
+    }
+
+    atexit(cleanup_socket);
+    atexit(close_logging);
+
+    long long last_log_ms = 0;
+
+    while (running) {
+        int temp_c = get_temp();
+        if (temp_c < 0) temp_c = 0;
+
+        if (temp_c > max_temp_c) max_temp_c = temp_c;
+
+        int speed;
+        if (manual_mode) speed = manual_speed;
+        else speed = fan_curve(temp_c);
+
+        set_fan_speed(speed);
+        detect_zero_rpm();
+
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+
+        if (logging_enabled && (now_ms - last_log_ms >= log_interval_ms)) {
+            log_sample(temp_c, speed, active_gpu);
+            last_log_ms = now_ms;
+        }
+
+        poll_control_socket();
+
+        struct timespec sleep_ts = {0, 100000000};
+        nanosleep(&sleep_ts, NULL);
+    }
+
+    restore_fan_auto();
+    return 0;
 }
 
 void draw_bar(WINDOW *win, int y, int x, int width, double value, double max,
@@ -514,12 +1093,17 @@ void draw_curve_info(WINDOW *win, int y, int x, int current_temp_c) {
     int points_linear[][2] = {
         {20, 0}, {100, 100}
     };
-    
-    switch (curve_profile) {
-        case 1: points = points_quiet; n = 8; break;
-        case 2: points = points_aggressive; n = 8; break;
-        case 3: points = points_linear; n = 2; break;
-        default: points = points_default; n = 8; break;
+
+    if (curve_profile == 4 && custom_curve_points_count >= 2) {
+        points = custom_curve;
+        n = custom_curve_points_count;
+    } else {
+        switch (curve_profile) {
+            case 1: points = points_quiet; n = 8; break;
+            case 2: points = points_aggressive; n = 8; break;
+            case 3: points = points_linear; n = 2; break;
+            default: points = points_default; n = 8; break;
+        }
     }
 
     wattron(win, A_BOLD);
@@ -546,7 +1130,9 @@ void draw_controls(WINDOW *win, int start_y, int x) {
     mvwprintw(win, y++, x, "--- Controls ---");
     wattroff(win, A_BOLD);
     y++;
-    mvwprintw(win, y++, x, " 1-%d       Select GPU", gpu_count);
+    if (gpu_count > 1) {
+        mvwprintw(win, y++, x, " 1-%d       Select GPU", gpu_count);
+    }
     mvwprintw(win, y++, x, " M         Toggle Manual / Auto");
     mvwprintw(win, y++, x, " T         Cycle °C / °F / K");
     mvwprintw(win, y++, x, " S         Cycle temp sensor");
@@ -609,7 +1195,7 @@ void draw_ui(int temp_c, int speed) {
     }
 
     int status_row = info_row + 6;
-    
+
     move(status_row, 0);
     clrtoeol();
     wattron(stdscr, A_BOLD);
@@ -620,14 +1206,14 @@ void draw_ui(int temp_c, int speed) {
     if (has_colors()) wattron(stdscr, COLOR_PAIR(mode_color) | A_BOLD);
     wprintw(stdscr, "%s", manual_mode ? "MANUAL" : "AUTO (curve)");
     if (has_colors()) wattroff(stdscr, COLOR_PAIR(mode_color) | A_BOLD);
-    
+
     GPUState *g = &gpus[active_gpu];
     if (!g->overdrive_available && g->gpu_generation >= GEN_RDNA3) {
         wattron(stdscr, COLOR_PAIR(3));
         wprintw(stdscr, "  [Overdrive not enabled!]");
         wattroff(stdscr, COLOR_PAIR(3));
     }
-    
+
     if (zero_rpm_active) {
         wprintw(stdscr, "  [Zero RPM active]");
     }
@@ -677,14 +1263,15 @@ void draw_ui(int temp_c, int speed) {
 
     time_t now = time(NULL);
     int elapsed = (int)(now - start_time);
-    mvprintw(status_row + 4, 30, "Runtime: %02d:%02d:%02d", 
+    mvprintw(status_row + 4, 30, "Runtime: %02d:%02d:%02d",
              elapsed / 3600, (elapsed % 3600) / 60, elapsed % 60);
     clrtoeol();
+
     int bar_width = max_x - 22;
     if (bar_width > 60) bar_width = 60;
 
     int bar_row = status_row + 6;
-    
+
     move(bar_row, 0);
     clrtoeol();
     if (has_colors()) {
@@ -726,31 +1313,109 @@ void draw_ui(int temp_c, int speed) {
     if (has_colors())
         wattroff(stdscr, COLOR_PAIR(1) | COLOR_PAIR(2) | COLOR_PAIR(3));
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 14; i++) {
         move(bar_row + 4 + i, 4);
         clrtoeol();
     }
     draw_curve_info(stdscr, bar_row + 4, 4, temp_c);
 
     int control_col = max_x > 80 ? 46 : 4;
-    int control_row = max_x > 80 ? bar_row + 4 : bar_row + 14;
+    int control_row = max_x > 80 ? bar_row + 4 : bar_row + 18;
     draw_controls(stdscr, control_row, control_col);
 
     if (!g->overdrive_available && g->gpu_generation >= GEN_RDNA3) {
         wattron(stdscr, COLOR_PAIR(3) | A_BOLD);
         int warn_row = max_y - 2;
-        mvprintw(warn_row, 2, "RDNA3 requires amdgpu.ppfeaturemask=0xffffffff for manual control.");
-        mvprintw(warn_row + 1, 2, "Add to kernel cmdline or /etc/modprobe.d/amdgpu.conf and reboot.");
+        int mask = read_file_int("/sys/module/amdgpu/parameters/ppfeaturemask");
+        if (mask >= 0 && (mask & 0x4000) == 0) {
+            mvprintw(warn_row, 2, "ppfeaturemask=%#x - overdrive disabled!", mask);
+            mvprintw(warn_row + 1, 2, "Set amdgpu.ppfeaturemask=0xffffffff in kernel cmdline.");
+        } else {
+            mvprintw(warn_row, 2, "Overdrive unavailable despite ppfeaturemask - check kernel version.");
+        }
         wattroff(stdscr, COLOR_PAIR(3) | A_BOLD);
     }
 
     refresh();
 }
 
-int main() {
+int main(int argc, char *argv[]) {
+    char socket_path[128];
+    get_socket_path(socket_path, sizeof(socket_path));
+
+    if (argc > 1 && strcmp(argv[1], "--help") == 0) {
+        printf("Usage: cagt [options]\n");
+        printf("Options:\n");
+        printf("  --daemon      Run in background\n");
+        printf("  --log         Enable CSV logging\n");
+        printf("  --help        Show this help\n");
+        printf("\nIf daemon is running, commands can be sent:\n");
+        printf("  cagt status\n");
+        printf("  cagt gpu 2\n");
+        printf("  cagt fan 75\n");
+        printf("  cagt fan auto\n");
+        printf("  cagt fan gpu\n");
+        printf("  cagt curve quiet\n");
+        printf("  cagt curve list\n");
+        printf("  cagt log 5s\n");
+        printf("  cagt log off\n");
+        printf("  cagt quit\n");
+        return 0;
+    }
+
+    int is_command = 0;
+    int has_daemon_flag = 0;
+    int has_log_flag = 0;
+    int has_help_flag = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--daemon") == 0) has_daemon_flag = 1;
+        else if (strcmp(argv[i], "--log") == 0) has_log_flag = 1;
+        else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) has_help_flag = 1;
+        else is_command = 1;
+    }
+
+    if (has_help_flag && !is_command) {
+        printf("Usage: cagt [options]\n");
+        printf("Options:\n");
+        printf("  --daemon      Run in background\n");
+        printf("  --log         Enable CSV logging\n");
+        printf("  --help        Show this help\n");
+        printf("\nIf daemon is running, commands can be sent:\n");
+        printf("  cagt status\n");
+        printf("  cagt gpu 2\n");
+        printf("  cagt fan 75\n");
+        printf("  cagt fan auto\n");
+        printf("  cagt fan gpu\n");
+        printf("  cagt curve quiet\n");
+        printf("  cagt curve list\n");
+        printf("  cagt log 5s\n");
+        printf("  cagt log off\n");
+        printf("  cagt quit\n");
+        return 0;
+    }
+
+    if (is_command && access(socket_path, F_OK) != 0) {
+        printf("[CAGT] Daemon is not running.\n");
+        printf("[CAGT] Start it with: sudo cagt --daemon\n");
+        return 1;
+    }
+
+    if (is_command && access(socket_path, F_OK) == 0) {
+        return send_command_to_daemon(argc - 1, &argv[1]);
+    }
+
+    if (argc == 1 && access(socket_path, F_OK) == 0) {
+        printf("[CAGT] Daemon already running.\n");
+        printf("[CAGT] Commands: cagt status | cagt gpu <1-%d> | cagt fan <0-100> | cagt fan auto | cagt fan gpu | cagt curve <name> | cagt log <interval> | cagt quit\n", gpu_count);
+        return 0;
+    }
+
+    daemon_mode = has_daemon_flag;
+    logging_enabled = has_log_flag;
+
     signal(SIGINT, handle_exit);
     signal(SIGTERM, handle_exit);
-    atexit(restore_fan_auto);
 
     if (!detect_amd_gpus()) {
         printf("[CAGT] No AMD GPU found.\n");
@@ -758,6 +1423,19 @@ int main() {
     }
 
     detect_driver();
+    load_settings();
+    load_custom_curve();
+
+    for (int i = 0; i < gpu_count; i++) {
+        gpus[i].manual_mode = saved_manual_mode[i];
+        gpus[i].manual_speed = saved_manual_speed[i];
+        gpus[i].curve_profile = saved_curve_profile[i];
+    }
+    temp_unit = saved_temp_unit[0];
+    temp_sensor = saved_temp_sensor[0];
+    if (temp_sensor == 1 && !gpus[0].temp2_available) temp_sensor = 0;
+    if (temp_sensor == 2 && !gpus[0].temp3_available) temp_sensor = 0;
+
     sync_globals_from_gpu(0);
     start_time = time(NULL);
 
@@ -768,10 +1446,7 @@ int main() {
         printf("[CAGT]   Fans detected: %d\n", gpus[i].fan_count);
     }
     printf("[CAGT] Driver: %s\n", driver_name);
-    if (!overdrive_available && gpus[0].gpu_generation >= GEN_RDNA3)
-        printf("[CAGT] WARNING: Overdrive not enabled on some GPUs.\n");
-    printf("[CAGT] Starting TUI...\n");
-    sleep(1);
+    check_ppfeaturemask();
 
     for (int i = 0; i < gpu_count; i++) {
         set_fan_manual_all_gpu(&gpus[i]);
@@ -791,6 +1466,21 @@ int main() {
         return 1;
     }
 
+    if (logging_enabled) init_logging();
+    atexit(save_settings);
+    atexit(restore_fan_auto);
+    atexit(close_logging);
+
+    if (daemon_mode) {
+        printf("[CAGT] Starting daemon...\n");
+        sleep(1);
+        daemonize();
+        return run_daemon();
+    }
+
+    printf("[CAGT] Starting TUI...\n");
+    sleep(1);
+
     initscr();
     cbreak();
     noecho();
@@ -806,10 +1496,12 @@ int main() {
         init_pair(3, COLOR_RED, COLOR_BLACK);
     }
 
+    long long last_log_ms = 0;
+
     while (running) {
         int temp_c = get_temp();
         if (temp_c < 0) temp_c = 0;
-        
+
         if (temp_c > max_temp_c) max_temp_c = temp_c;
 
         int speed;
@@ -818,6 +1510,16 @@ int main() {
 
         set_fan_speed(speed);
         detect_zero_rpm();
+
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+
+        if (logging_enabled && (now_ms - last_log_ms >= log_interval_ms)) {
+            log_sample(temp_c, speed, active_gpu);
+            last_log_ms = now_ms;
+        }
+
         draw_ui(temp_c, speed);
 
         int ch = getch();
@@ -829,7 +1531,7 @@ int main() {
             if (temp_sensor == 2 && !temp3_available) temp_sensor = 0;
             continue;
         }
-        
+
         switch (ch) {
             case 'q': case 'Q': running = 0; break;
             case 'm': case 'M':
@@ -842,7 +1544,7 @@ int main() {
                 if (temp_sensor == 1 && !temp2_available) temp_sensor = 2;
                 if (temp_sensor == 2 && !temp3_available) temp_sensor = 0;
                 break;
-            case 'c': case 'C': curve_profile = (curve_profile + 1) % 4; break;
+            case 'c': case 'C': curve_profile = (curve_profile + 1) % 5; break;
             case 'r': case 'R': max_temp_c = temp_c; break;
             case '+': case '=':
                 if (!manual_mode) { manual_mode = 1; manual_speed = speed; }
@@ -857,7 +1559,6 @@ int main() {
                 if (!manual_mode) { manual_mode = 1; manual_speed = speed; }
                 manual_speed -= 1; break;
             case '0':
-                if (gpu_count > 1 && active_gpu > 0) break;
                 if (!manual_mode) manual_mode = 1;
                 manual_speed = 0;
                 break;
@@ -869,7 +1570,7 @@ int main() {
 
     endwin();
     restore_fan_auto();
-    
+
     if (restore_failed) {
         printf("[CAGT] WARNING: Could not restore automatic fan control.\n");
         printf("[CAGT] Fan left at safe speed. Reboot to fully restore.\n");
